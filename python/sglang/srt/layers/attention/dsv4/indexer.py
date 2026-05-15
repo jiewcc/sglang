@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils import add_prefix, is_flashinfer_available, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
@@ -184,6 +184,47 @@ def topk_transform_512_pytorch_vectorized(
             valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
         )
         out_raw_indices.copy_(raw_indices)
+
+
+def topk_transform_512_flashinfer(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    import flashinfer
+
+    TOPK = out_page_indices.shape[1]
+    batch_size, max_seq_len = scores.shape
+    device = scores.device
+
+    # SGLang page_tables: [B, num_pages], page_tables[b][j] = physical page number for logical page j
+    # FlashInfer src_page_table: [B, max_seq_len], src_page_table[b][pos] = (physical_page << page_bits) | offset
+    # We need to expand: flashinfer_table[b][pos] = (page_tables[b][pos >> page_bits] << page_bits) | (pos & page_mask)
+    page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
+    page_mask = page_size - 1
+
+    positions = torch.arange(max_seq_len, device=device, dtype=torch.int32)  # [max_seq_len]
+    page_idx = positions >> page_bits    # [max_seq_len] 逻辑 page 编号
+    offset = positions & page_mask       # [max_seq_len] page 内偏移
+
+    # gather physical pages: [B, max_seq_len]
+    page_idx_expanded = page_idx.unsqueeze(0).expand(batch_size, -1)  # [B, max_seq_len]
+    physical_pages = torch.gather(page_tables, dim=1, index=page_idx_expanded.long())  # [B, max_seq_len]
+
+    # encode into flashinfer format
+    src_page_table = (physical_pages << page_bits) | offset.unsqueeze(0)  # [B, max_seq_len]
+    src_page_table = src_page_table.to(torch.int32)
+
+    result = flashinfer.top_k_page_table_transform(
+        scores,
+        src_page_table,
+        seq_lens,
+        TOPK,
+        deterministic=False,
+    )
+    out_page_indices.copy_(result)
 
 
 @triton.jit
@@ -428,6 +469,14 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,
+            )
+        elif envs.SGLANG_TOPK_TRANSFORM_512_FLASHINFER.get() and raw_indices is None:
+            topk_transform_512_flashinfer(
+                logits,
+                indexer_metadata.c4_seq_lens,
+                core_metadata.page_table,
+                core_metadata.c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
             )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
             topk_transform_512_v2(
