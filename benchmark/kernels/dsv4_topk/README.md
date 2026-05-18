@@ -49,14 +49,28 @@ python benchmark/kernels/dsv4_topk/bench_dsv4_topk.py --seq-pattern descending
 
 ## Outputs
 
-The script prints a Markdown table and, when `--output-dir` is set, writes:
+The script prints a compact aligned table in the terminal and, when
+`--output-dir` is set, writes:
 
 - `dsv4_topk_results.csv`
 - `dsv4_topk_results.md`
 
-The table reports median, p20, p80, min, max latency in milliseconds, plus
+The terminal table reports median, p20, and p80 latency in milliseconds, plus
 speedup against `torch` and SGLang default `dsv4` when those providers are part
-of the same case.
+of the same case. The Markdown/CSV files keep the full min/max latency and full
+error notes.
+
+To print Markdown in the terminal instead:
+
+```bash
+python benchmark/kernels/dsv4_topk/bench_dsv4_topk.py --terminal-format markdown
+```
+
+For compact output, long notes are truncated. Adjust this with:
+
+```bash
+python benchmark/kernels/dsv4_topk/bench_dsv4_topk.py --terminal-note-width 96
+```
 
 ## Notes
 

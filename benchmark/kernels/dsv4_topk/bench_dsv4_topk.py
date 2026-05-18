@@ -381,6 +381,92 @@ def render_markdown(rows: list[BenchRow]) -> str:
     return "\n".join(lines)
 
 
+def truncate_text(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value
+    if width <= 1:
+        return value[:width]
+    return value[: width - 1] + "..."
+
+
+def render_terminal_table(rows: list[BenchRow], note_width: int = 48) -> str:
+    headers = [
+        "provider",
+        "B",
+        "max_len",
+        "min_len",
+        "page",
+        "status",
+        "median",
+        "p20",
+        "p80",
+        "x_torch",
+        "x_dsv4",
+        "note",
+    ]
+    body = []
+    for row in rows:
+        body.append(
+            [
+                row.provider,
+                str(row.batch_size),
+                str(row.max_seq_len),
+                str(row.min_seq_len),
+                str(row.page_size),
+                row.status,
+                format_float(row.median_ms),
+                format_float(row.p20_ms),
+                format_float(row.p80_ms),
+                format_float(row.speedup_vs_torch, 2),
+                format_float(row.speedup_vs_dsv4, 2),
+                truncate_text(row.note, note_width),
+            ]
+        )
+
+    widths = [len(header) for header in headers]
+    for values in body:
+        for i, value in enumerate(values):
+            widths[i] = max(widths[i], len(value))
+
+    right_aligned = {
+        "B",
+        "max_len",
+        "min_len",
+        "page",
+        "median",
+        "p20",
+        "p80",
+        "x_torch",
+        "x_dsv4",
+    }
+
+    def format_row(values: list[str]) -> str:
+        cells = []
+        for header, value, width in zip(headers, values, widths):
+            if header in right_aligned:
+                cells.append(value.rjust(width))
+            else:
+                cells.append(value.ljust(width))
+        return "  ".join(cells)
+
+    lines = [
+        format_row(headers),
+        format_row(["-" * width for width in widths]),
+    ]
+    lines.extend(format_row(values) for values in body)
+    return "\n".join(lines)
+
+
+def render_for_terminal(
+    rows: list[BenchRow], terminal_format: str, note_width: int
+) -> str:
+    if terminal_format == "markdown":
+        return render_markdown(rows)
+    return render_terminal_table(rows, note_width=note_width)
+
+
 def write_outputs(rows: list[BenchRow], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "dsv4_topk_results.csv"
@@ -440,6 +526,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional directory for CSV and Markdown result files.",
     )
+    parser.add_argument(
+        "--terminal-format",
+        choices=("compact", "markdown"),
+        default="compact",
+        help="Print an aligned terminal table by default, or Markdown for copying.",
+    )
+    parser.add_argument(
+        "--terminal-note-width",
+        type=int,
+        default=48,
+        help="Maximum note column width for compact terminal output.",
+    )
     return parser.parse_args()
 
 
@@ -483,10 +581,22 @@ def main() -> None:
                 check=not args.no_check,
             )
         )
-        print(render_markdown(rows[-len(args.providers) :]))
+        print(
+            render_for_terminal(
+                rows[-len(args.providers) :],
+                terminal_format=args.terminal_format,
+                note_width=args.terminal_note_width,
+            )
+        )
 
     print("\n# DeepSeek V4 TopK Benchmark Results")
-    print(render_markdown(rows))
+    print(
+        render_for_terminal(
+            rows,
+            terminal_format=args.terminal_format,
+            note_width=args.terminal_note_width,
+        )
+    )
     if args.output_dir is not None:
         write_outputs(rows, args.output_dir)
 
