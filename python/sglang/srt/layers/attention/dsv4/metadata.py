@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+import logging
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -9,8 +10,23 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
+logger = logging.getLogger(__name__)
+_TOPK_BACKEND_LOGGED = False
+
 if TYPE_CHECKING:
     pass
+
+
+def get_configured_topk_backend_name() -> str:
+    if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+        return "torch"
+    if envs.SGLANG_TOPK_TRANSFORM_512_FLASHINFER.get():
+        return "flashinfer (falls back when raw_indices are required)"
+    if envs.SGLANG_OPT_USE_TOPK_V3.get():
+        return "dsv4_v3"
+    if envs.SGLANG_OPT_USE_TOPK_V2.get():
+        return "dsv4_v2 (uses dsv4_v3 when raw_indices are required)"
+    return "dsv4"
 
 
 """
@@ -103,6 +119,14 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
+        global _TOPK_BACKEND_LOGGED
+        if not _TOPK_BACKEND_LOGGED:
+            logger.info(
+                "DeepSeek V4 C4 indexer topk backend: %s",
+                get_configured_topk_backend_name(),
+            )
+            _TOPK_BACKEND_LOGGED = True
+
         if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             self.deep_gemm_metadata = None
         else:
@@ -124,9 +148,14 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
+        topk_torch_enabled = envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+        if not topk_torch_enabled and envs.SGLANG_OPT_USE_TOPK_V3.get():
+            from sglang.jit_kernel.deepseek_v4 import plan_topk_v3
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
+            self.topk_metadata = plan_topk_v3(self.c4_seq_lens)
+        elif not topk_torch_enabled and envs.SGLANG_OPT_USE_TOPK_V2.get():
+            from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
+
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))

@@ -591,6 +591,7 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
+    SGLANG_OPT_USE_TOPK_V3 = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_FLASHINFER = EnvBool(False)
 
     # GEMM / kernel fusion
