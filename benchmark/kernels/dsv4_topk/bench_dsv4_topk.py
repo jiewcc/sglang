@@ -23,6 +23,14 @@ if str(PYTHON_ROOT) not in sys.path:
 
 TOPK = 512
 DEFAULT_PROVIDERS = ("torch", "flashinfer", "dsv4", "dsv4_v2")
+ALL_PROVIDERS = (
+    "torch",
+    "flashinfer",
+    "flashinfer_prepare",
+    "flashinfer_core",
+    "dsv4",
+    "dsv4_v2",
+)
 DEFAULT_SEQ_LENS = (16_384, 65_536, 98_304, 120_000, 262_144, 524_288, 1_048_576)
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
 
@@ -100,6 +108,36 @@ def import_providers() -> dict[str, Callable[..., None]]:
     ) -> None:
         topk_transform_512_flashinfer(scores, seq_lens, page_tables, out, page_size)
 
+    def run_flashinfer_prepare(
+        scores: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_tables: torch.Tensor,
+        out: torch.Tensor,
+        page_size: int,
+    ) -> None:
+        _ = scores, seq_lens, out
+        make_flashinfer_src_page_table(page_tables, scores.shape[1], page_size)
+
+    def run_flashinfer_core(
+        scores: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_tables: torch.Tensor,
+        out: torch.Tensor,
+        page_size: int,
+        src_page_table: torch.Tensor,
+    ) -> None:
+        _ = page_tables, page_size
+        import flashinfer
+
+        result = flashinfer.top_k_page_table_transform(
+            scores,
+            src_page_table,
+            seq_lens,
+            out.shape[1],
+            deterministic=False,
+        )
+        out.copy_(result)
+
     def run_dsv4(
         scores: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -120,13 +158,37 @@ def import_providers() -> dict[str, Callable[..., None]]:
         topk_transform_512_v2(scores, seq_lens, page_tables, out, page_size, metadata)
 
     run_dsv4_v2._needs_topk_v2_metadata = True  # type: ignore[attr-defined]
+    run_flashinfer_prepare._skip_check = True  # type: ignore[attr-defined]
+    run_flashinfer_prepare._skip_speedup = True  # type: ignore[attr-defined]
+    run_flashinfer_core._needs_flashinfer_src_page_table = True  # type: ignore[attr-defined]
 
     return {
         "torch": run_torch,
         "flashinfer": run_flashinfer,
+        "flashinfer_prepare": run_flashinfer_prepare,
+        "flashinfer_core": run_flashinfer_core,
         "dsv4": run_dsv4,
         "dsv4_v2": run_dsv4_v2,
     }
+
+
+def make_flashinfer_src_page_table(
+    page_tables: torch.Tensor,
+    max_seq_len: int,
+    page_size: int,
+) -> torch.Tensor:
+    batch_size = page_tables.shape[0]
+    device = page_tables.device
+    page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
+    page_mask = page_size - 1
+
+    positions = torch.arange(max_seq_len, device=device, dtype=torch.int32)
+    page_idx = positions >> page_bits
+    offset = positions & page_mask
+    page_idx_expanded = page_idx.unsqueeze(0).expand(batch_size, -1)
+    physical_pages = torch.gather(page_tables, dim=1, index=page_idx_expanded.long())
+    src_page_table = (physical_pages << page_bits) | offset.unsqueeze(0)
+    return src_page_table.to(torch.int32)
 
 
 def make_seq_lens(
@@ -211,7 +273,7 @@ def timed_run(
     iters: int,
 ) -> tuple[float, float, float, float, float]:
     out = new_output(inputs)
-    metadata = make_metadata(fn, inputs)
+    metadata = make_metadata(fn, inputs, page_size)
     for _ in range(warmup_iters):
         call_provider(fn, inputs, out, page_size, metadata)
     torch.cuda.synchronize()
@@ -252,17 +314,23 @@ def run_provider_once(
     fn: Callable[..., None], inputs: Inputs, page_size: int
 ) -> torch.Tensor:
     out = new_output(inputs)
-    metadata = make_metadata(fn, inputs)
+    metadata = make_metadata(fn, inputs, page_size)
     call_provider(fn, inputs, out, page_size, metadata)
     torch.cuda.synchronize()
     return out
 
 
-def make_metadata(fn: Callable[..., None], inputs: Inputs) -> torch.Tensor | None:
+def make_metadata(
+    fn: Callable[..., None], inputs: Inputs, page_size: int
+) -> torch.Tensor | None:
     if getattr(fn, "_needs_topk_v2_metadata", False):
         from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
 
         return plan_topk_v2(inputs.seq_lens)
+    if getattr(fn, "_needs_flashinfer_src_page_table", False):
+        return make_flashinfer_src_page_table(
+            inputs.page_tables, inputs.scores.shape[1], page_size=page_size
+        )
     return None
 
 
@@ -304,7 +372,7 @@ def run_case(
         )
         fn = providers[provider]
         try:
-            if check:
+            if check and not getattr(fn, "_skip_check", False):
                 out = run_provider_once(fn, inputs, case.page_size)
                 if reference is None:
                     reference = out
@@ -323,7 +391,11 @@ def run_case(
     torch_ms = by_provider.get("torch").median_ms if "torch" in by_provider else None
     dsv4_ms = by_provider.get("dsv4").median_ms if "dsv4" in by_provider else None
     for row in rows:
-        if row.status != "ok" or row.median_ms is None:
+        if (
+            row.status != "ok"
+            or row.median_ms is None
+            or getattr(providers[row.provider], "_skip_speedup", False)
+        ):
             continue
         if torch_ms:
             row.speedup_vs_torch = torch_ms / row.median_ms
@@ -490,7 +562,7 @@ def parse_args() -> argparse.Namespace:
         "--providers",
         nargs="+",
         default=list(DEFAULT_PROVIDERS),
-        choices=list(DEFAULT_PROVIDERS),
+        choices=list(ALL_PROVIDERS),
         help="Providers to benchmark.",
     )
     parser.add_argument(

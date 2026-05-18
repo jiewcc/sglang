@@ -1,11 +1,14 @@
 # DeepSeek V4 Indexer TopK Benchmarks
 
 This directory is a small benchmark project for the DeepSeek V4 indexer TopK
-transform path in SGLang. It compares the four implementations wired in
+transform path in SGLang. It compares the implementations wired in
 `python/sglang/srt/layers/attention/dsv4/indexer.py`:
 
 - `torch`: the PyTorch vectorized path using `torch.topk`
-- `flashinfer`: `flashinfer.top_k_page_table_transform`
+- `flashinfer`: end-to-end FlashInfer path, including `src_page_table` creation
+- `flashinfer_prepare`: only build the expanded FlashInfer `src_page_table`
+- `flashinfer_core`: only call `flashinfer.top_k_page_table_transform` with a
+  prebuilt `src_page_table`, then copy the result to `out_page_indices`
 - `dsv4`: SGLang's default JIT TopK transform
 - `dsv4_v2`: SGLang's planned/workspace JIT TopK transform
 
@@ -39,6 +42,13 @@ python benchmark/kernels/dsv4_topk/bench_dsv4_topk.py \
   --seq-lens 16384 65536 98304 120000 262144 524288 1048576 \
   --providers torch flashinfer dsv4 dsv4_v2 \
   --output-dir benchmark/kernels/dsv4_topk/results
+```
+
+To split FlashInfer preparation from the core transform:
+
+```bash
+python benchmark/kernels/dsv4_topk/bench_dsv4_topk.py \
+  --providers flashinfer flashinfer_prepare flashinfer_core
 ```
 
 For variable-length batches, make each row shorter than the previous one:
@@ -78,5 +88,9 @@ python benchmark/kernels/dsv4_topk/bench_dsv4_topk.py --terminal-note-width 96
   skipped.
 - `dsv4` and `dsv4_v2` require CUDA JIT compilation on the first warmup call.
   Compilation time is excluded from the measured iterations.
+- `flashinfer_prepare` is not a TopK provider, so it is timed but skipped during
+  correctness checks and speedup comparisons.
+- Timings use CUDA events, so they measure GPU work queued by each provider.
+  Python CPU launch overhead is not included.
 - The PyTorch helper in `indexer.py` is fixed to TopK 512, so this benchmark
   intentionally focuses on `K=512`.
