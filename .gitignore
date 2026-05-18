@@ -231,6 +231,9 @@ work_dirs/
 # VSCode
 .vscode
 
+# codex
+.agents
+
 # Autoenv
 .env.leave
 
