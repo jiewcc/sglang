@@ -22,7 +22,7 @@ if str(PYTHON_ROOT) not in sys.path:
 
 
 TOPK = 512
-DEFAULT_PROVIDERS = ("torch", "flashinfer", "dsv4", "dsv4_v2")
+DEFAULT_PROVIDERS = ("torch", "flashinfer", "dsv4", "dsv4_v2", "dsv4_v3")
 ALL_PROVIDERS = (
     "torch",
     "flashinfer",
@@ -30,6 +30,7 @@ ALL_PROVIDERS = (
     "flashinfer_core",
     "dsv4",
     "dsv4_v2",
+    "dsv4_v3",
 )
 DEFAULT_SEQ_LENS = (16_384, 65_536, 98_304, 120_000, 262_144, 524_288, 1_048_576)
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8)
@@ -82,6 +83,7 @@ def import_providers() -> dict[str, Callable[..., None]]:
     from sglang.jit_kernel.deepseek_v4 import (
         topk_transform_512,
         topk_transform_512_v2,
+        topk_transform_512_v3,
     )
     from sglang.srt.layers.attention.dsv4.indexer import (
         topk_transform_512_flashinfer,
@@ -94,9 +96,10 @@ def import_providers() -> dict[str, Callable[..., None]]:
         page_tables: torch.Tensor,
         out: torch.Tensor,
         page_size: int,
+        raw_out: torch.Tensor | None = None,
     ) -> None:
         topk_transform_512_pytorch_vectorized(
-            scores, seq_lens, page_tables, out, page_size
+            scores, seq_lens, page_tables, out, page_size, raw_out
         )
 
     def run_flashinfer(
@@ -144,8 +147,9 @@ def import_providers() -> dict[str, Callable[..., None]]:
         page_tables: torch.Tensor,
         out: torch.Tensor,
         page_size: int,
+        raw_out: torch.Tensor | None = None,
     ) -> None:
-        topk_transform_512(scores, seq_lens, page_tables, out, page_size)
+        topk_transform_512(scores, seq_lens, page_tables, out, page_size, raw_out)
 
     def run_dsv4_v2(
         scores: torch.Tensor,
@@ -157,7 +161,24 @@ def import_providers() -> dict[str, Callable[..., None]]:
     ) -> None:
         topk_transform_512_v2(scores, seq_lens, page_tables, out, page_size, metadata)
 
+    def run_dsv4_v3(
+        scores: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_tables: torch.Tensor,
+        out: torch.Tensor,
+        page_size: int,
+        metadata: torch.Tensor,
+        raw_out: torch.Tensor | None = None,
+    ) -> None:
+        topk_transform_512_v3(
+            scores, seq_lens, page_tables, out, page_size, metadata, raw_out
+        )
+
+    run_torch._supports_raw_output = True  # type: ignore[attr-defined]
+    run_dsv4._supports_raw_output = True  # type: ignore[attr-defined]
     run_dsv4_v2._needs_topk_v2_metadata = True  # type: ignore[attr-defined]
+    run_dsv4_v3._needs_topk_v2_metadata = True  # type: ignore[attr-defined]
+    run_dsv4_v3._supports_raw_output = True  # type: ignore[attr-defined]
     run_flashinfer_prepare._skip_check = True  # type: ignore[attr-defined]
     run_flashinfer_prepare._skip_speedup = True  # type: ignore[attr-defined]
     run_flashinfer_core._needs_flashinfer_src_page_table = True  # type: ignore[attr-defined]
@@ -169,6 +190,7 @@ def import_providers() -> dict[str, Callable[..., None]]:
         "flashinfer_core": run_flashinfer_core,
         "dsv4": run_dsv4,
         "dsv4_v2": run_dsv4_v2,
+        "dsv4_v3": run_dsv4_v3,
     }
 
 
@@ -246,6 +268,10 @@ def new_output(inputs: Inputs) -> torch.Tensor:
     )
 
 
+def new_raw_output(inputs: Inputs) -> torch.Tensor:
+    return torch.empty_like(new_output(inputs))
+
+
 def valid_sorted(out: torch.Tensor) -> list[torch.Tensor]:
     result: list[torch.Tensor] = []
     for row in out:
@@ -273,9 +299,10 @@ def timed_run(
     iters: int,
 ) -> tuple[float, float, float, float, float]:
     out = new_output(inputs)
+    raw_out = new_raw_output(inputs) if supports_raw_output(fn) else None
     metadata = make_metadata(fn, inputs, page_size)
     for _ in range(warmup_iters):
-        call_provider(fn, inputs, out, page_size, metadata)
+        call_provider(fn, inputs, out, page_size, metadata, raw_out)
     torch.cuda.synchronize()
 
     timings: list[float] = []
@@ -283,7 +310,7 @@ def timed_run(
     end = torch.cuda.Event(enable_timing=True)
     for _ in range(iters):
         start.record()
-        call_provider(fn, inputs, out, page_size, metadata)
+        call_provider(fn, inputs, out, page_size, metadata, raw_out)
         end.record()
         end.synchronize()
         timings.append(float(start.elapsed_time(end)))
@@ -312,12 +339,17 @@ def percentile(sorted_values: list[float], q: float) -> float:
 
 def run_provider_once(
     fn: Callable[..., None], inputs: Inputs, page_size: int
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     out = new_output(inputs)
+    raw_out = new_raw_output(inputs) if supports_raw_output(fn) else None
     metadata = make_metadata(fn, inputs, page_size)
-    call_provider(fn, inputs, out, page_size, metadata)
+    call_provider(fn, inputs, out, page_size, metadata, raw_out)
     torch.cuda.synchronize()
-    return out
+    return out, raw_out
+
+
+def supports_raw_output(fn: Callable[..., None]) -> bool:
+    return bool(getattr(fn, "_supports_raw_output", False))
 
 
 def make_metadata(
@@ -340,11 +372,24 @@ def call_provider(
     out: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor | None,
+    raw_out: torch.Tensor | None = None,
 ) -> None:
-    if metadata is None:
+    if metadata is None and raw_out is None:
         fn(inputs.scores, inputs.seq_lens, inputs.page_tables, out, page_size)
-    else:
+    elif metadata is None:
+        fn(inputs.scores, inputs.seq_lens, inputs.page_tables, out, page_size, raw_out)
+    elif raw_out is None:
         fn(inputs.scores, inputs.seq_lens, inputs.page_tables, out, page_size, metadata)
+    else:
+        fn(
+            inputs.scores,
+            inputs.seq_lens,
+            inputs.page_tables,
+            out,
+            page_size,
+            metadata,
+            raw_out,
+        )
 
 
 def run_case(
@@ -360,6 +405,7 @@ def run_case(
     inputs = make_inputs(case, seed=seed, device=device)
     rows: list[BenchRow] = []
     reference: torch.Tensor | None = None
+    raw_reference: torch.Tensor | None = None
 
     for provider in provider_names:
         row = BenchRow(
@@ -373,11 +419,16 @@ def run_case(
         fn = providers[provider]
         try:
             if check and not getattr(fn, "_skip_check", False):
-                out = run_provider_once(fn, inputs, case.page_size)
+                out, raw_out = run_provider_once(fn, inputs, case.page_size)
                 if reference is None:
                     reference = out
                 else:
                     assert_same_selection(out, reference)
+                if raw_out is not None:
+                    if raw_reference is None:
+                        raw_reference = raw_out
+                    else:
+                        assert_same_selection(raw_out, raw_reference)
 
             row.median_ms, row.p20_ms, row.p80_ms, row.min_ms, row.max_ms = timed_run(
                 fn, inputs, case.page_size, warmup_iters, iters

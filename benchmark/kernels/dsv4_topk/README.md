@@ -11,6 +11,7 @@ transform path in SGLang. It compares the implementations wired in
   prebuilt `src_page_table`, then copy the result to `out_page_indices`
 - `dsv4`: SGLang's default JIT TopK transform
 - `dsv4_v2`: SGLang's planned/workspace JIT TopK transform
+- `dsv4_v3`: v2-based JIT TopK transform with raw index output enabled
 
 The benchmark generates one shared synthetic decode workload per shape:
 
@@ -40,7 +41,7 @@ Useful long-context run:
 python benchmark/kernels/dsv4_topk/bench_dsv4_topk.py \
   --batch-sizes 1 2 4 \
   --seq-lens 16384 65536 98304 120000 262144 524288 1048576 \
-  --providers torch flashinfer dsv4 dsv4_v2 \
+  --providers torch flashinfer dsv4 dsv4_v2 dsv4_v3 \
   --output-dir benchmark/kernels/dsv4_topk/results
 ```
 
@@ -90,6 +91,8 @@ python benchmark/kernels/dsv4_topk/bench_dsv4_topk.py --terminal-note-width 96
   Compilation time is excluded from the measured iterations.
 - `flashinfer_prepare` is not a TopK provider, so it is timed but skipped during
   correctness checks and speedup comparisons.
+- For providers that support raw index output (`torch`, `dsv4`, `dsv4_v3`), the
+  correctness check also compares the selected raw-index set.
 - Timings use CUDA events, so they measure GPU work queued by each provider.
   Python CPU launch overhead is not included.
 - The PyTorch helper in `indexer.py` is fixed to TopK 512, so this benchmark
