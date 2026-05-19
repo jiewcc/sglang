@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -232,31 +233,43 @@ def topk_transform_512_flashinfer(
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
 
-    src_page_table = torch.empty(
-        (batch_size, max_seq_len), dtype=torch.int32, device=device
+    chunk_rows = int(
+        os.getenv("SGLANG_TOPK_TRANSFORM_512_FLASHINFER_CHUNK_ROWS", "128")
     )
+    chunk_rows = max(1, chunk_rows)
     block = 256
-    grid = (batch_size, triton.cdiv(max_seq_len, block))
-    _build_flashinfer_src_page_table_kernel[grid](
-        page_tables,
-        src_page_table,
-        max_seq_len,
-        page_bits,
-        page_mask,
-        page_tables.stride(0),
-        page_tables.stride(1),
-        src_page_table.stride(0),
-        BLOCK=block,
-    )
 
-    result = flashinfer.top_k_page_table_transform(
-        scores,
-        src_page_table,
-        seq_lens,
-        TOPK,
-        deterministic=False,
-    )
-    out_page_indices.copy_(result)
+    for start in range(0, batch_size, chunk_rows):
+        end = min(start + chunk_rows, batch_size)
+        chunk_size = end - start
+        scores_chunk = scores[start:end]
+        seq_lens_chunk = seq_lens[start:end]
+        page_tables_chunk = page_tables[start:end]
+
+        src_page_table = torch.empty(
+            (chunk_size, max_seq_len), dtype=torch.int32, device=device
+        )
+        grid = (chunk_size, triton.cdiv(max_seq_len, block))
+        _build_flashinfer_src_page_table_kernel[grid](
+            page_tables_chunk,
+            src_page_table,
+            max_seq_len,
+            page_bits,
+            page_mask,
+            page_tables_chunk.stride(0),
+            page_tables_chunk.stride(1),
+            src_page_table.stride(0),
+            BLOCK=block,
+        )
+
+        result = flashinfer.top_k_page_table_transform(
+            scores_chunk,
+            src_page_table,
+            seq_lens_chunk,
+            TOPK,
+            deterministic=False,
+        )
+        out_page_indices[start:end].copy_(result)
 
 
 @triton.jit
