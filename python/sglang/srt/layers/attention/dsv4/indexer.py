@@ -179,6 +179,36 @@ def topk_transform_512_pytorch_vectorized(
         out_raw_indices.copy_(raw_indices)
 
 
+@triton.jit
+def _build_flashinfer_src_page_table_kernel(
+    page_tables_ptr,
+    out_ptr,
+    max_seq_len: tl.constexpr,
+    page_bits: tl.constexpr,
+    page_mask: tl.constexpr,
+    page_tables_stride_b: tl.constexpr,
+    page_tables_stride_page: tl.constexpr,
+    out_stride_b: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    batch_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offs = block_id * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < max_seq_len
+
+    logical_page = offs >> page_bits
+    offset = offs & page_mask
+    physical_page = tl.load(
+        page_tables_ptr
+        + batch_id * page_tables_stride_b
+        + logical_page * page_tables_stride_page,
+        mask=mask,
+        other=0,
+    ).to(tl.int32)
+    encoded = (physical_page << page_bits) | offset
+    tl.store(out_ptr + batch_id * out_stride_b + offs, encoded, mask=mask)
+
+
 def topk_transform_512_flashinfer(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -202,17 +232,22 @@ def topk_transform_512_flashinfer(
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
 
-    positions = torch.arange(max_seq_len, device=device, dtype=torch.int32)  # [max_seq_len]
-    page_idx = positions >> page_bits    # [max_seq_len] 逻辑 page 编号
-    offset = positions & page_mask       # [max_seq_len] page 内偏移
-
-    # gather physical pages: [B, max_seq_len]
-    page_idx_expanded = page_idx.unsqueeze(0).expand(batch_size, -1)  # [B, max_seq_len]
-    physical_pages = torch.gather(page_tables, dim=1, index=page_idx_expanded.long())  # [B, max_seq_len]
-
-    # encode into flashinfer format
-    src_page_table = (physical_pages << page_bits) | offset.unsqueeze(0)  # [B, max_seq_len]
-    src_page_table = src_page_table.to(torch.int32)
+    src_page_table = torch.empty(
+        (batch_size, max_seq_len), dtype=torch.int32, device=device
+    )
+    block = 256
+    grid = (batch_size, triton.cdiv(max_seq_len, block))
+    _build_flashinfer_src_page_table_kernel[grid](
+        page_tables,
+        src_page_table,
+        max_seq_len,
+        page_bits,
+        page_mask,
+        page_tables.stride(0),
+        page_tables.stride(1),
+        src_page_table.stride(0),
+        BLOCK=block,
+    )
 
     result = flashinfer.top_k_page_table_transform(
         scores,
