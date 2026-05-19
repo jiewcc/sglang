@@ -169,16 +169,13 @@ def topk_transform_512_pytorch_vectorized(
     page_indices = (physical_pages << page_bits) | offset_in_page
     page_indices = page_indices.to(torch.int32)
 
-    page_indices = torch.where(
-        valid_topk, page_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-    )
+    invalid_page_indices = torch.full_like(page_indices, -1)
+    page_indices = torch.where(valid_topk, page_indices, invalid_page_indices)
 
     out_page_indices.copy_(page_indices)
 
     if out_raw_indices is not None:
-        raw_indices = torch.where(
-            valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-        )
+        raw_indices = torch.where(valid_topk, raw_indices, invalid_indices)
         out_raw_indices.copy_(raw_indices)
 
 
