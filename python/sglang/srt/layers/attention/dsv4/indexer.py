@@ -196,6 +196,10 @@ def topk_transform_512_flashinfer(
 ) -> None:
     import flashinfer
 
+    # FlashInfer's top-k TVM wrapper requires a contiguous input tensor, while
+    # the DSV4 logits producer may return a strided [batch, max_seq_len] view.
+    scores = scores.contiguous()
+
     TOPK = out_page_indices.shape[1]
     batch_size, max_seq_len = scores.shape
     device = scores.device
